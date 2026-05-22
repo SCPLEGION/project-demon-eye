@@ -10,7 +10,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
+python -c "import sys; v=sys.version_info; sys.exit(0 if (3,10)<=v<(3,13) else 1)"
+if errorlevel 1 (
+    echo ERROR: unsupported Python version.
+    echo        Mediapipe and onnxruntime-directml have no Python 3.13 wheels yet.
+    echo        Install Python 3.10, 3.11, or 3.12 from https://www.python.org/downloads/
+    echo        and re-run this script.
+    python --version
+    exit /b 1
+)
+
 echo [1/4] Installing Python packages...
+echo   - removing any pre-existing onnxruntime variants (they conflict with onnxruntime-directml)
+python -m pip uninstall -y onnxruntime onnxruntime-gpu onnxruntime-azure onnxruntime-silicon >NUL 2>&1
 python -m pip install --upgrade pip
 python -m pip install onnxruntime-directml opencv-python websockets mediapipe numpy zeroconf psutil ultralytics
 
