@@ -17,6 +17,8 @@ namespace Starfire
 
         readonly List<Row> _pool = new List<Row>();
         readonly Dictionary<string, string> _seen = new Dictionary<string, string>(); // ip→nodeId
+        readonly HashSet<string> _nowKeys = new HashSet<string>();
+        readonly List<string> _vanishedScratch = new List<string>();
         bool _visible;
         float _alpha;
 
@@ -68,11 +70,11 @@ namespace Starfire
             if (_alpha <= 0f) return;
 
             var map = DataStore.NetworkMap ?? new NetworkNode[0];
-            var nowKeys = new HashSet<string>();
+            _nowKeys.Clear();
             int slot = 0;
             foreach (var n in map)
             {
-                nowKeys.Add(n.IP);
+                _nowKeys.Add(n.IP);
                 if (slot >= _pool.Count) break;
                 var r = _pool[slot++];
                 if (!r.Go.activeSelf) r.Go.SetActive(true);
@@ -111,10 +113,10 @@ namespace Starfire
                 var rt = r.Go.GetComponent<RectTransform>();
                 if (rt) rt.anchoredPosition = new Vector2(0f, -(slot - 1) * 32f);
             }
-            // mark vanished
-            var vanished = new List<string>();
-            foreach (var kv in _seen) if (!nowKeys.Contains(kv.Key)) vanished.Add(kv.Key);
-            foreach (var ip in vanished) _seen.Remove(ip);
+            // mark vanished (reuse scratch list to avoid per-frame alloc)
+            _vanishedScratch.Clear();
+            foreach (var kv in _seen) if (!_nowKeys.Contains(kv.Key)) _vanishedScratch.Add(kv.Key);
+            for (int i = 0; i < _vanishedScratch.Count; i++) _seen.Remove(_vanishedScratch[i]);
 
             // deactivate unused slots
             for (int i = slot; i < _pool.Count; i++)

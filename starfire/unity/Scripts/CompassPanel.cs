@@ -43,7 +43,7 @@ namespace Starfire
                     for (int i = 0; i < Card.Length; i++)
                     {
                         if (i == idx) sb.Append($"<b><color=#FFFFFF>{Card[i]}</color></b>");
-                        else sb.Append($"<alpha=#80>{Card[i]}");
+                        else sb.Append($"<alpha=#80>{Card[i]}<alpha=#FF>");
                         if (i < Card.Length - 1) sb.Append("  ");
                     }
                     CardinalRow.text = sb.ToString();

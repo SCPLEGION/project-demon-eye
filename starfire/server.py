@@ -338,17 +338,6 @@ class FaceOut:
     fps: float = 0.0
 
 
-def _curl(p_a, p_b, p_c) -> float:
-    import math
-    ax, ay = p_a; bx, by = p_b; cx, cy = p_c
-    v1 = (ax - bx, ay - by); v2 = (cx - bx, cy - by)
-    dot = v1[0]*v2[0] + v1[1]*v2[1]
-    n1 = math.hypot(*v1); n2 = math.hypot(*v2)
-    if n1 == 0 or n2 == 0:
-        return 0.0
-    return math.degrees(math.acos(max(-1.0, min(1.0, dot/(n1*n2)))))
-
-
 def face_thread(cfg: dict, bus: FrameBus, out: FaceOut, stop: threading.Event) -> None:
     fps_limit = float(cfg.get("face_fps_limit", 30))
     min_dt = 1.0 / fps_limit
@@ -380,7 +369,7 @@ def face_thread(cfg: dict, bus: FrameBus, out: FaceOut, stop: threading.Event) -
             if res.multi_face_landmarks:
                 for lms in res.multi_face_landmarks:
                     pts = [(p.x, p.y) for p in lms.landmark]
-                    # FaceMesh indices: upper lip 13, lower lip 14; brow 65, eye outer 33
+                    # FaceMesh indices: upper lip 13, lower lip 14; left-brow inner 105, eye outer 33
                     mouth_open = abs(pts[13][1] - pts[14][1]) > 0.04
                     brow_raised = (pts[105][1] - pts[33][1]) > 0.10
                     eye_squint  = abs(pts[159][1] - pts[145][1]) < 0.012

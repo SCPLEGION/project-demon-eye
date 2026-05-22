@@ -12,15 +12,12 @@ namespace Starfire
     public class VoiceCommand : MonoBehaviour
     {
         public float CommandWindow = 4f;
-        public string PcDomain = "starfire.yourdomain.com";
 
         enum VState { Standby, WakeDetected, Listening, Processing }
         VState _state = VState.Standby;
         float _windowT;
 
         static readonly string[] WakeWords  = { "astartes", "brother", "aquila" };
-        static readonly string[] HideWords  = { "hide", "cloak" };
-        static readonly string[] ShowWords  = { "reveal", "show" };
 
 #if UNITY_ANDROID && !UNITY_EDITOR
         AndroidJavaObject _recognizer;

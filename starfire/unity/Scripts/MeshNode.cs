@@ -24,6 +24,7 @@ namespace Starfire
         bool _running;
         float _nextHeartbeat;
         string _lastPayload;
+        TaskCompletionSource<bool> _closedTcs;
 
         void Start()
         {
@@ -36,20 +37,34 @@ namespace Starfire
         {
             while (_running)
             {
+                bool connected = false;
                 try
                 {
                     DataStore.ConnectionStatus = "CONNECTING";
+                    _closedTcs = new TaskCompletionSource<bool>();
                     _ws = new WebSocket(Uri);
                     _ws.OnOpen    += OnOpen;
                     _ws.OnError   += OnError;
                     _ws.OnClose   += OnClose;
                     _ws.OnMessage += OnMessage;
+                    // Connect() returns when the socket closes — await it so we
+                    // don't spin a second connection while the first is still alive.
                     await _ws.Connect();
+                    connected = true;
                 }
                 catch (Exception e)
                 {
                     Debug.LogWarning($"MeshNode: connect threw {e.Message}");
                 }
+                // If Connect() returned early without OnClose firing (e.g. transport
+                // races on some platforms), wait for the close signal as a safety net.
+                if (connected && _closedTcs != null && !_closedTcs.Task.IsCompleted)
+                {
+                    var winner = await Task.WhenAny(_closedTcs.Task, Task.Delay(50));
+                    // brief grace; if still open we proceed anyway — the inner
+                    // OnClose handler keeps DataStore consistent.
+                }
+                if (!_running) break;
                 DataStore.ConnectionStatus = "RECONNECTING";
                 await Task.Delay((int)(_backoff * 1000));
                 _backoff = Mathf.Min(_backoff * 1.5f, 10f);
@@ -70,6 +85,7 @@ namespace Starfire
             Debug.LogWarning($"MeshNode: WS closed {code}");
             DataStore.ConnectionStatus = "LOST";
             DataStore.CurrentMode = "OFFLINE";
+            try { _closedTcs?.TrySetResult(true); } catch { }
         }
 
         void OnMessage(byte[] bytes)

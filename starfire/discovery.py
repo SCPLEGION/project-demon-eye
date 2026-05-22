@@ -63,6 +63,7 @@ PING_TIMEOUT_MS = 500
 WS_TIMEOUT_S    = 0.5
 SCAN_PORT       = 8765
 IS_WINDOWS      = platform.system().lower().startswith("win")
+PING_CONCURRENCY = 64   # cap simultaneous ping subprocesses
 
 
 @dataclass
@@ -201,7 +202,13 @@ async def _probe_host(ip: str, iface_label: str) -> NetworkNode | None:
 
 
 async def _scan_subnet(net: ipaddress.IPv4Network, label: str) -> list[NetworkNode]:
-    tasks = [_probe_host(str(ip), label) for ip in net.hosts()]
+    sem = asyncio.Semaphore(PING_CONCURRENCY)
+
+    async def _bounded(ip_str: str):
+        async with sem:
+            return await _probe_host(ip_str, label)
+
+    tasks = [_bounded(str(ip)) for ip in net.hosts()]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     nodes: list[NetworkNode] = []
     for r in results:
