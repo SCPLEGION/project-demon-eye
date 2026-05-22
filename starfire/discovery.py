@@ -152,6 +152,41 @@ async def _ping(ip: str) -> int | None:
     return max(1, int((time.perf_counter() - start) * 1000))
 
 
+IP_WEBCAM_PORT = 8080
+
+
+async def _fingerprint_ipwebcam(ip: str) -> dict | None:
+    """Probe port 8080 for the IP Webcam app on Android.  Returns a phone
+    identity packet if the server banner matches, else None.  Used to
+    identify the phone even when sensor_node.py (Termux) isn't running."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, IP_WEBCAM_PORT),
+            timeout=WS_TIMEOUT_S,
+        )
+    except (asyncio.TimeoutError, OSError, Exception):
+        return None
+    try:
+        writer.write(b"GET / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+        try:
+            await asyncio.wait_for(writer.drain(), timeout=WS_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return None
+        try:
+            data = await asyncio.wait_for(reader.read(512), timeout=WS_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return None
+        if b"IP Webcam" in data or b"ipwebcam" in data.lower():
+            return {"node_type": "phone", "node_id": "SENSOR_ALPHA"}
+        return None
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+        except Exception:
+            pass
+
+
 async def _fingerprint(ip: str) -> dict | None:
     """Try WebSocket on :8765, read first packet, return its content or None."""
     uri = f"ws://{ip}:{SCAN_PORT}"
@@ -179,7 +214,15 @@ async def _probe_host(ip: str, iface_label: str) -> NetworkNode | None:
     rtt = await _ping(ip)
     if rtt is None:
         return None
-    info = await _fingerprint(ip)
+    ws_info, cam_info = await asyncio.gather(
+        _fingerprint(ip), _fingerprint_ipwebcam(ip),
+        return_exceptions=True,
+    )
+    if isinstance(ws_info, BaseException): ws_info = None
+    if isinstance(cam_info, BaseException): cam_info = None
+    # WS probe wins (real node identity); IP Webcam is a fallback to identify
+    # the phone even when sensor_node.py isn't running in Termux yet.
+    info = ws_info or cam_info
     if info is None:
         role = "UNKNOWN CONTACT"
         node_id = "???"
@@ -233,7 +276,9 @@ def _print_nodes(nodes: list[NetworkNode]) -> None:
     for n in nodes:
         latency = f"{n.latency_ms}ms" if n.status == "ONLINE" else "---"
         line = f"{n.ip:<15} {n.role:<18} [{n.node_id}]"
-        print(f"║  {line:<48}{latency:>8}║")
+        # Right-pad to fixed width so the border lines up for both numeric
+        # latency ("4ms") and the placeholder ("---").
+        print(f"║  {line:<46}{latency:>7}  ║")
     print("╠══════════════════════════════════════════════════════════╣")
     brothers = sum(1 for n in nodes if n.status == "ONLINE")
     unknown  = sum(1 for n in nodes if n.status != "ONLINE")

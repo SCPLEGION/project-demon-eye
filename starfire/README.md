@@ -222,8 +222,22 @@ headset (look around — it's a tiny dialog).
 
 **DirectML not detected.**
 `python -c "import onnxruntime as ort; print(ort.get_available_providers())"`
-should list `DmlExecutionProvider`. If not:
-`pip install --upgrade onnxruntime-directml` and update AMD drivers.
+should list `DmlExecutionProvider`. If you see only `AzureExecutionProvider`
+and `CPUExecutionProvider`, a plain `onnxruntime` (or `onnxruntime-azure`)
+is shadowing the DirectML wheel — both packages install into the same
+namespace so only one wins. Reinstall cleanly:
+```
+pip uninstall -y onnxruntime onnxruntime-azure onnxruntime-gpu
+pip install onnxruntime-directml
+```
+Then make sure your AMD GPU drivers are current. `setup_pc.bat` performs
+this uninstall automatically, but only if you re-run it after pulling.
+
+**Python 3.13 — `module 'mediapipe' has no attribute 'solutions'`.**
+Mediapipe (and `onnxruntime-directml`) don't yet publish Python 3.13
+wheels. `setup_pc.bat` refuses to run on 3.13; install Python 3.10, 3.11,
+or 3.12. The server also tolerates a stub mediapipe at runtime — it will
+print "face detection disabled" and keep YOLO / depth running.
 
 **`starfire.local` not resolving.**
 On Windows, install **Bonjour Print Services** (Apple) to enable mDNS.
