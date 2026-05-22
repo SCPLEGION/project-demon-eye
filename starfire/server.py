@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import sys
 import threading
 import time
 from collections import deque
+from http import HTTPStatus
 from pathlib import Path
 
 import numpy as np
@@ -31,9 +33,17 @@ except ImportError:
 
 try:
     import mediapipe as mp
+    # On Python 3.13 pip resolves a stub package that lacks the `solutions`
+    # namespace.  Probe it once at startup so face_thread can no-op cleanly
+    # instead of crashing the thread.
+    _ = getattr(mp, "solutions", None) or getattr(mp, "tasks", None)
+    if _ is None:
+        print("WARNING: mediapipe is installed but lacks both `solutions` and "
+              "`tasks` namespaces (Python 3.13 stub?) — face detection disabled.")
+        mp = None
 except ImportError:
-    print("ERROR: mediapipe not installed.")
-    sys.exit(1)
+    print("WARNING: mediapipe not installed — face detection disabled.")
+    mp = None
 
 try:
     import websockets
@@ -90,10 +100,24 @@ def make_session(model_path: Path) -> ort.InferenceSession:
     providers: list = []
     if "DmlExecutionProvider" in available:
         providers.append(("DmlExecutionProvider", {"device_id": 0}))
-    else:
-        print("WARNING: DmlExecutionProvider unavailable — falling back to CPU")
     providers.append("CPUExecutionProvider")
     return ort.InferenceSession(str(model_path), sess_options=sess_options, providers=providers)
+
+
+def probe_directml() -> None:
+    """Print a single, actionable warning if DirectML isn't loaded."""
+    available = ort.get_available_providers()
+    if "DmlExecutionProvider" in available:
+        return
+    print("")
+    print("=" * 64)
+    print("WARNING: DmlExecutionProvider not loaded — all ML on CPU.")
+    print(f"         Providers available: {available}")
+    print("         To fix:")
+    print("           pip uninstall -y onnxruntime onnxruntime-azure onnxruntime-gpu")
+    print("           pip install onnxruntime-directml")
+    print("=" * 64)
+    print("")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -338,15 +362,87 @@ class FaceOut:
     fps: float = 0.0
 
 
+def _make_face_engine():
+    """Return (process_fn, close_fn) for whichever mediapipe API is available,
+    or None if neither works.  `process_fn(rgb_image)` returns a list of
+    landmark-point lists (each list yields (x,y) tuples normalized 0..1)."""
+    if mp is None:
+        return None
+    # ─── Modern Tasks API (mediapipe >= 0.10.x with stable Tasks namespace)
+    try:
+        import urllib.request
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python.vision import (
+            FaceLandmarker, FaceLandmarkerOptions, RunningMode,
+        )
+        from mediapipe import Image as MpImage, ImageFormat as MpImageFormat
+
+        model_path = Path(__file__).with_name("face_landmarker.task")
+        if not model_path.exists():
+            url = ("https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+                   "face_landmarker/float16/latest/face_landmarker.task")
+            try:
+                urllib.request.urlretrieve(url, model_path)
+            except Exception as e:
+                raise RuntimeError(f"could not fetch face_landmarker.task: {e}")
+        opts = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(model_path)),
+            running_mode=RunningMode.IMAGE,
+            num_faces=4,
+        )
+        landmarker = FaceLandmarker.create_from_options(opts)
+
+        def _process(rgb):
+            img = MpImage(image_format=MpImageFormat.SRGB, data=rgb)
+            res = landmarker.detect(img)
+            out_faces = []
+            for lms in (res.face_landmarks or []):
+                out_faces.append([(p.x, p.y) for p in lms])
+            return out_faces
+
+        def _close():
+            try: landmarker.close()
+            except Exception: pass
+        print("FACE: using mediapipe.tasks FaceLandmarker")
+        return _process, _close
+    except Exception as e:
+        print(f"FACE: Tasks API unavailable ({type(e).__name__}: {e}) — trying legacy solutions")
+
+    # ─── Legacy solutions API
+    try:
+        face_mesh_mod = mp.solutions.face_mesh
+        mp_face = face_mesh_mod.FaceMesh(
+            static_image_mode=False, max_num_faces=4,
+            refine_landmarks=False, min_detection_confidence=0.5)
+
+        def _process(rgb):
+            res = mp_face.process(rgb)
+            out_faces = []
+            for lms in (res.multi_face_landmarks or []):
+                out_faces.append([(p.x, p.y) for p in lms.landmark])
+            return out_faces
+
+        def _close():
+            try: mp_face.close()
+            except Exception: pass
+        print("FACE: using legacy mp.solutions.face_mesh")
+        return _process, _close
+    except Exception as e:
+        print(f"FACE: legacy solutions also unavailable ({type(e).__name__}: {e}) — face thread disabled")
+        return None
+
+
 def face_thread(cfg: dict, bus: FrameBus, out: FaceOut, stop: threading.Event) -> None:
+    engine = _make_face_engine()
+    if engine is None:
+        return
+    process_fn, close_fn = engine
+
     fps_limit = float(cfg.get("face_fps_limit", 30))
     min_dt = 1.0 / fps_limit
     last = time.time()
     frames = 0
     fps_t = time.time()
-    mp_face = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=4,
-        refine_landmarks=False, min_detection_confidence=0.5)
     try:
         while not stop.is_set():
             if not bus.raw:
@@ -361,31 +457,28 @@ def face_thread(cfg: dict, bus: FrameBus, out: FaceOut, stop: threading.Event) -
             small = cv2.resize(frame, (320, 240))
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             try:
-                res = mp_face.process(rgb)
+                landmark_sets = process_fn(rgb)
             except Exception as e:
                 print(f"FACE: process error {e}")
                 continue
             faces = []
-            if res.multi_face_landmarks:
-                for lms in res.multi_face_landmarks:
-                    pts = [(p.x, p.y) for p in lms.landmark]
-                    # FaceMesh indices: upper lip 13, lower lip 14; left-brow inner 105, eye outer 33
-                    mouth_open = abs(pts[13][1] - pts[14][1]) > 0.04
-                    brow_raised = (pts[105][1] - pts[33][1]) > 0.10
-                    eye_squint  = abs(pts[159][1] - pts[145][1]) < 0.012
-                    cx = pts[1][0]
-                    if cx < 0.4:
-                        pos = "left"
-                    elif cx > 0.6:
-                        pos = "right"
-                    else:
-                        pos = "center"
-                    faces.append({
-                        "mouth_open":  bool(mouth_open),
-                        "brow_raised": bool(brow_raised),
-                        "eye_squint":  bool(eye_squint),
-                        "position":    pos,
-                    })
+            for pts in landmark_sets:
+                if len(pts) < 160:
+                    continue
+                # FaceMesh indices: upper lip 13, lower lip 14; left-brow inner 105, eye outer 33
+                mouth_open = abs(pts[13][1] - pts[14][1]) > 0.04
+                brow_raised = (pts[105][1] - pts[33][1]) > 0.10
+                eye_squint  = abs(pts[159][1] - pts[145][1]) < 0.012
+                cx = pts[1][0]
+                if cx < 0.4:    pos = "left"
+                elif cx > 0.6:  pos = "right"
+                else:           pos = "center"
+                faces.append({
+                    "mouth_open":  bool(mouth_open),
+                    "brow_raised": bool(brow_raised),
+                    "eye_squint":  bool(eye_squint),
+                    "position":    pos,
+                })
             out.faces = faces
             frames += 1
             if now - fps_t >= 1.0:
@@ -393,7 +486,7 @@ def face_thread(cfg: dict, bus: FrameBus, out: FaceOut, stop: threading.Event) -
                 frames = 0
                 fps_t = now
     finally:
-        mp_face.close()
+        close_fn()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -544,6 +637,46 @@ async def discovery_loop(hub: Hub, cfg: dict, stop: asyncio.Event) -> None:
             pass
 
 
+class _DropInvalidHandshake(logging.Filter):
+    """Suppress noisy tracebacks for stray TCP connections that never finish a
+    WebSocket handshake (port scanners, antivirus probes, etc.)."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if "did not receive a valid HTTP request" in msg: return False
+        if "opening handshake failed" in msg:             return False
+        if "connection closed while reading HTTP request" in msg: return False
+        return True
+
+
+def _install_ws_log_filter() -> None:
+    f = _DropInvalidHandshake()
+    for name in ("websockets", "websockets.server", "websockets.asyncio.server"):
+        lg = logging.getLogger(name)
+        lg.addFilter(f)
+        if lg.level == logging.NOTSET or lg.level < logging.WARNING:
+            lg.setLevel(logging.WARNING)
+
+
+async def _process_request(connection, request):
+    """Return early with HTTP 400 for non-WS clients so they disconnect cleanly
+    instead of leaving the server mid-handshake.  Returning None lets the
+    upgrade proceed normally."""
+    try:
+        headers = getattr(request, "headers", {}) or {}
+        upgrade = headers.get("Upgrade", "") or headers.get("upgrade", "")
+        if "websocket" not in str(upgrade).lower():
+            from websockets.http11 import Response
+            return Response(HTTPStatus.BAD_REQUEST, "Bad Request",
+                            headers={"Content-Type": "text/plain"},
+                            body=b"This is the Starfire WebSocket broker.\n")
+    except Exception:
+        return None
+    return None
+
+
 async def main() -> None:
     cfg = load_config()
     print("╔═══════════════════════════════╗")
@@ -551,6 +684,8 @@ async def main() -> None:
     print("║  MACHINE SPIRIT AWAKENING     ║")
     print("╚═══════════════════════════════╝")
     print(f"ONNX providers available: {ort.get_available_providers()}")
+    probe_directml()
+    _install_ws_log_filter()
 
     bus = FrameBus()
     yo  = YoloOut()
@@ -575,7 +710,8 @@ async def main() -> None:
 
     port = int(cfg.get("pc_port", 8765))
     server = await websockets.serve(_handler, "0.0.0.0", port, max_size=None,
-                                    ping_interval=20, ping_timeout=20)
+                                    ping_interval=20, ping_timeout=20,
+                                    process_request=_process_request)
     print(f"BROKER LISTENING: 0.0.0.0:{port}")
 
     tasks = [
